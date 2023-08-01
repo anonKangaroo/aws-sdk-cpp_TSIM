@@ -21,6 +21,7 @@
 #include <winhttp.h>
 #include <sstream>
 #include <iostream>
+#include <wincrypt.h>
 
 using namespace Aws::Client;
 using namespace Aws::Http;
@@ -102,6 +103,7 @@ WinHttpSyncHttpClient::WinHttpSyncHttpClient(const ClientConfiguration& config) 
     }
     WinHttpEnableHttp2(GetOpenHandle());
     m_verifySSL = config.verifySSL;
+	m_tls_cert = config.windowsTLSCertPath; 
     if (m_verifySSL)
     {
         //disable insecure tls protocols, otherwise you might as well turn ssl verification off.
@@ -123,6 +125,95 @@ WinHttpSyncHttpClient::WinHttpSyncHttpClient(const ClientConfiguration& config) 
         GetOpenHandle(), config.maxConnections, config.requestTimeoutMs, config.connectTimeoutMs, config.enableTcpKeepAlive, config.tcpKeepAliveIntervalMs));
 }
 
+//added code on top of aws sdk for winHttp support
+bool WinHttpSyncHttpClient::HandleTLSWindowsCert(void *hHttpRequest) const{
+	bool returnCode = false; 
+	HCERTSTORE		hMyStore;
+	PCCERT_CONTEXT pCertContext = NULL;
+	hMyStore = CertOpenSystemStore(0, TEXT("MY"));
+
+	if (hMyStore)
+	{
+		pCertContext = CertFindCertificateInStore(hMyStore,
+			X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+			0,
+			CERT_FIND_SUBJECT_STR,
+			m_tls_cert.c_str(), //Subject string in the certificate. so VWSCLient
+			NULL);
+		if (pCertContext)
+		{
+			returnCode = WinHttpSetOption(hHttpRequest,
+				WINHTTP_OPTION_CLIENT_CERT_CONTEXT,
+				(LPVOID)pCertContext,
+				sizeof(CERT_CONTEXT));
+			CertFreeCertificateContext(pCertContext);
+		}
+		CertCloseStore(hMyStore, 0);
+	}
+
+	if (!returnCode) {
+		AWS_LOGSTREAM_FATAL(GetLogTag(), "Failed to find the cert with subject specified in LocalMachine//My"); 
+		return false; // if we failed so far blast that back 
+	}
+
+	/*
+	**Now do a ping to server, this is for the self signed CA case
+	**and winHttp having a fit about it. We will ping thrice for this 
+	*/
+	bool retry = true; 
+	uint64_t maxRetries = 3; 
+	for (uint64_t attempt = 0; attempt < maxRetries && retry; attempt++) {
+		auto error = NO_ERROR;
+		bool bResults = false;
+		retry = false; 
+		DWORD dwFlags; 
+		 
+		if (hHttpRequest)
+			bResults = WinHttpSendRequest(hHttpRequest,
+				WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+				WINHTTP_NO_REQUEST_DATA, 0,
+				0, 0);
+
+		//recieve 
+		if (bResults) {
+			bResults = WinHttpReceiveResponse(hHttpRequest, NULL);
+		} 
+		error = GetLastError();
+
+		switch (error)
+		{
+		case ERROR_WINHTTP_SECURE_FAILURE:
+				
+			dwFlags = (SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+				SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE |
+				SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+				SECURITY_FLAG_IGNORE_CERT_DATE_INVALID);
+
+			if (WinHttpSetOption(
+				hHttpRequest,
+				WINHTTP_OPTION_SECURITY_FLAGS,
+				&dwFlags,
+				sizeof(dwFlags)))
+			{
+				retry = true;
+			}
+			break;
+
+		case ERROR_WINHTTP_RESEND_REQUEST:
+			retry = true;
+			break;
+		case NO_ERROR:
+			retry = false; 
+			break;
+		default:
+			retry = true; 
+			break;
+			
+		}
+	}
+
+	return returnCode; 
+}
 
 WinHttpSyncHttpClient::~WinHttpSyncHttpClient()
 {
@@ -167,6 +258,13 @@ void* WinHttpSyncHttpClient::OpenRequest(const std::shared_ptr<HttpRequest>& req
         if (!WinHttpSetOption(hHttpRequest, WINHTTP_OPTION_SECURITY_FLAGS, &flags, sizeof(flags)))
             AWS_LOGSTREAM_FATAL(GetLogTag(), "Failed to turn ssl cert ca verification off.");
     }
+	
+	
+	if(m_verifySSL && m_tls_cert.size()){
+		if(!HandleTLSWindowsCert((void *)hHttpRequest)){
+			AWS_LOGSTREAM_FATAL(GetLogTag(),  "Configuration Cert is not valid for request, there will be a cert error later."); 
+		}
+	}
 
     // WinHTTP doesn't have the option to turn off keep-alive, so we will only set the value if keep-alive is turned on.
     // see https://docs.microsoft.com/en-us/windows/desktop/winhttp/option-flags for more information on default values.

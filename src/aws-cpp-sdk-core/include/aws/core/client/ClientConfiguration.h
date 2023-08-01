@@ -309,7 +309,17 @@ namespace Aws
              */
             std::shared_ptr<smithy::components::tracing::TelemetryProvider> telemetryProvider =
                 smithy::components::tracing::NoopTelemetryProvider::CreateProvider();
+
+#ifdef _WIN32
+			/*
+			Added for ease of handling windows certifcates
+			*/
+			Aws::WString windowsTLSCertPath; //just subject to search for
+
+
+#endif //_WIN 32
         };
+
 
         /**
          * A helper function to initialize a retry strategy.
